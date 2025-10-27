@@ -29,6 +29,7 @@ int			hnsw_ef_search;
 int			hnsw_iterative_scan;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
+bool		hnsw_enable_prefetch;
 int			hnsw_lock_tranche_id;
 static relopt_kind hnsw_relopt_kind;
 
@@ -100,6 +101,12 @@ HnswInit(void)
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("hnsw.enable_prefetch", "Enables prefetch optimization for HNSW neighbor loading",
+							 "This optimization prefetches vector data pages during HNSW graph traversal. "
+							 "Requires enable_optimistic_buffer_reads to be enabled.",
+							 &hnsw_enable_prefetch,
+							 false, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }

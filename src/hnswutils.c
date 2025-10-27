@@ -11,9 +11,15 @@
 #include "lib/pairingheap.h"
 #include "sparsevec.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
+#include "storage/smgr.h"
 #include "utils/datum.h"
 #include "utils/memdebug.h"
 #include "utils/rel.h"
+
+#if PG_VERSION_NUM >= 160000
+#include "varatt.h"
+#endif
 
 #if PG_VERSION_NUM < 170000
 static inline uint64
@@ -523,14 +529,108 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 
 /*
  * Load an element and optionally get its distance from q
+ * cached_relation_id: Pre-computed relation ID (0 means compute it)
+ * have_cached_rid: Whether cached_relation_id is valid
  */
 static void
-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, uint32 cached_relation_id, bool have_cached_rid)
 {
 	Buffer		buf;
 	Page		page;
 	HnswElementTuple etup;
+	SMgrRelation smgr;
+	bool		found;
+	uint64		version;
+	BufferDesc *bufDesc;
 
+	/*
+	 * Try optimistic read path if enabled and buffer manager supports it.
+	 * This avoids taking buffer locks for read-only access.
+	 */
+	if (enable_optimistic_buffer_reads && 
+	    ActiveBufMgr->LookupAndOptimisticPin != NULL)
+	{
+		uint32 buf_id = 0;
+		void *entry_ptr = NULL;
+		
+		smgr = RelationGetSmgr(index);
+		
+		/* Use optimized path with cached relation_id if available */
+		if (have_cached_rid && CalicoLookupAndOptimisticPinWithRid != NULL)
+		{
+			/* Call Calico-specific function with cached relation_id to skip expensive lookup */
+			bufDesc = CalicoLookupAndOptimisticPinWithRid(
+				smgr,
+				MAIN_FORKNUM,
+				blkno,
+				&found,
+				&version,
+				&buf_id,
+				&entry_ptr,
+				cached_relation_id
+			);
+		}
+		else
+		{
+			/* Fall back to standard optimistic pin (computes relation_id internally) */
+			bufDesc = ActiveBufMgr->LookupAndOptimisticPin(
+				smgr,
+				MAIN_FORKNUM,
+				blkno,
+				&found,
+				&version,
+				&buf_id,
+				&entry_ptr
+			);
+		}
+		
+		if (found)
+		{
+			/* Got the buffer frame ID, access buffer pool directly to minimize cache misses */
+			//bufDesc = GetBufferDescriptor(frameId);
+			
+			/* Read shared_buffer page data optimistically */
+			page = BufferGetPage(buf_id + 1);
+			etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+			
+			Assert(HnswIsElementTuple(etup));
+			
+			/* Calculate distance */
+			if (distance != NULL)
+			{
+				if (DatumGetPointer(q->value) == NULL)
+					*distance = 0;
+				else
+					*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+			}
+			
+			/* Load element */
+			if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
+			{
+				if (*element == NULL)
+					*element = HnswInitElementFromBlock(blkno, offno);
+				
+				HnswLoadElementFromTuple(*element, etup, true, loadVec);
+			}
+			
+			/* Validate the optimistic read using cached entry_ptr - fast path */
+			if (ActiveBufMgr->LookupAndOptimisticValidate(entry_ptr, version))
+			{
+				/* Validation successful - data is consistent */
+				return;
+			}
+			
+			/*
+			 * Validation failed - fall through to locked path.
+			 * The page might have been evicted or modified.
+			 */
+		}
+	}
+	
+	/*
+	 * Traditional locked path:
+	 * Either optimistic read is disabled, not supported, or validation failed.
+	 */
 	/* Read vector */
 	buf = ReadBuffer(index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -567,7 +667,8 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
+	/* No cached relation_id for this public wrapper */
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, 0, false);
 }
 
 /*
@@ -754,7 +855,68 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	Page		page;
 	HnswNeighborTuple ntup;
 	int			start;
+	SMgrRelation smgr;
+	bool		found;
+	uint64		version;
+	uint32		buf_id;
+	void		*entry_ptr;
 
+	/*
+	 * Try optimistic read path if enabled and buffer manager supports it.
+	 * This avoids taking buffer locks for read-only access to neighbor data.
+	 */
+	if (enable_optimistic_buffer_reads && 
+	    ActiveBufMgr->LookupAndOptimisticPin != NULL)
+	{
+		smgr = RelationGetSmgr(index);
+		
+		/* Try optimistic pin without locking, get frameId and entry_ptr directly */
+		if (ActiveBufMgr->LookupAndOptimisticPin(
+			smgr,
+			MAIN_FORKNUM,
+			element->neighborPage,
+			&found,
+			&version,
+			&buf_id,
+			&entry_ptr) != NULL && found)
+		{
+			/* Read neighbor tuple data optimistically */
+			page = BufferGetPage(buf_id + 1);
+			ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
+
+			/*
+			 * Check version consistency:
+			 * Ensure the neighbor tuple has not been deleted or replaced
+			 */
+			if (ntup->version != element->version || ntup->count != (element->level + 2) * m)
+			{
+				/* Data validation failed - fall through to locked path */
+			}
+			else
+			{
+				/* Copy neighbor TIDs optimistically */
+				start = (element->level - lc) * m;
+				memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
+
+				/* Validate the optimistic read using cached entry_ptr - fast path */
+				if (ActiveBufMgr->LookupAndOptimisticValidate(entry_ptr, version))
+				{
+					/* Validation successful - data is consistent */
+					return true;
+				}
+
+				/*
+				 * Validation failed - fall through to locked path.
+				 * The neighbor page might have been evicted or modified.
+				 */
+			}
+		}
+	}
+
+	/*
+	 * Traditional locked path:
+	 * Either optimistic read is disabled, not supported, or validation failed.
+	 */
 	buf = ReadBuffer(index, element->neighborPage);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
@@ -779,19 +941,48 @@ HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation i
 	return true;
 }
 
+/* Structure for caching prefetch info */
+typedef struct HnswPrefetchCache
+{
+	Page		page;
+	ItemId		itemid;
+} HnswPrefetchCache;
+
 /*
  * Load unvisited neighbors from disk
+ * Returns prefetch_cache and prefetch_count as output parameters for caller to issue vector data prefetch
  */
 static void
-HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
+HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc, HnswPrefetchCache *prefetch_cache_out, int *prefetch_count_out)
 {
 	ItemPointerData indextids[HNSW_MAX_M * 2];
+	SMgrRelation smgr = NULL;
+	bool		use_prefetch = false;
+	
+	/* Arrays for batch lookup */
+	BlockNumber batch_blocknums[HNSW_MAX_M];
+	uint32		batch_frameids[HNSW_MAX_M];
+	bool		batch_found[HNSW_MAX_M];
+	int			batch_start = 0;  /* Track where current batch starts in unvisited array */
+
+#define BATCH_SIZE 6
 
 	*unvisitedLength = 0;
+	*prefetch_count_out = 0;
 
 	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
 		return;
 
+	/* Check if optimistic prefetch is available */
+	if (enable_optimistic_buffer_reads && 
+	    hnsw_enable_prefetch &&
+	    ActiveBufMgr->LookupAndOptimisticPinBatch != NULL)
+	{
+		smgr = RelationGetSmgr(index);
+		use_prefetch = true;
+	}
+
+	/* First pass: identify unvisited neighbors and issue batch prefetches when we reach BATCH_SIZE */
 	for (int i = 0; i < lm; i++)
 	{
 		ItemPointer indextid = &indextids[i];
@@ -803,8 +994,136 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 		tidhash_insert(v->tids, *indextid, &found);
 
 		if (!found)
-			unvisited[(*unvisitedLength)++].indextid = *indextid;
+		{
+			unvisited[*unvisitedLength].indextid = *indextid;
+			
+			/* Collect block number for batch prefetch */
+			if (use_prefetch)
+				batch_blocknums[*unvisitedLength] = ItemPointerGetBlockNumber(indextid);
+			
+			(*unvisitedLength)++;
+		}
 	}
+
+	/* Handle remaining items (less than BATCH_SIZE) */
+	if (use_prefetch && *unvisitedLength > batch_start)
+	{
+		int batch_count = *unvisitedLength - batch_start;
+		
+		/* Final batch call for remaining items */
+		ActiveBufMgr->LookupAndOptimisticPinBatch(
+			smgr,
+			MAIN_FORKNUM,
+			&batch_blocknums[batch_start],
+			batch_count,
+			&batch_frameids[batch_start],
+			&batch_found[batch_start]);
+
+		/* Process results and issue prefetches with loop unrolling for better MLP */
+		int j = batch_start;
+		
+		/* Process 4 items at a time for better ILP/MLP */
+		for (; j + 3 < *unvisitedLength; j += 4)
+		{
+			Page		prefetch_page0, prefetch_page1, prefetch_page2, prefetch_page3;
+			OffsetNumber offno0, offno1, offno2, offno3;
+			ItemId		itemid0, itemid1, itemid2, itemid3;
+			bool		found0, found1, found2, found3;
+			
+			/* Load all found flags */
+			found0 = batch_found[j];
+			found1 = batch_found[j + 1];
+			found2 = batch_found[j + 2];
+			found3 = batch_found[j + 3];
+			
+			/* Get pages for all 4 items - these loads can happen in parallel */
+			if (found0)
+			{
+				ItemPointer tid0 = &unvisited[j].indextid;
+				prefetch_page0 = BufferGetPage(batch_frameids[j] + 1);
+				offno0 = ItemPointerGetOffsetNumber(tid0);
+				itemid0 = PageGetItemId(prefetch_page0, offno0);
+			}
+			if (found1)
+			{
+				ItemPointer tid1 = &unvisited[j + 1].indextid;
+				prefetch_page1 = BufferGetPage(batch_frameids[j + 1] + 1);
+				offno1 = ItemPointerGetOffsetNumber(tid1);
+				itemid1 = PageGetItemId(prefetch_page1, offno1);
+			}
+			if (found2)
+			{
+				ItemPointer tid2 = &unvisited[j + 2].indextid;
+				prefetch_page2 = BufferGetPage(batch_frameids[j + 2] + 1);
+				offno2 = ItemPointerGetOffsetNumber(tid2);
+				itemid2 = PageGetItemId(prefetch_page2, offno2);
+			}
+			if (found3)
+			{
+				ItemPointer tid3 = &unvisited[j + 3].indextid;
+				prefetch_page3 = BufferGetPage(batch_frameids[j + 3] + 1);
+				offno3 = ItemPointerGetOffsetNumber(tid3);
+				itemid3 = PageGetItemId(prefetch_page3, offno3);
+			}
+			
+			/* Cache and prefetch - issue all prefetches together for MLP */
+			if (found0)
+			{
+				prefetch_cache_out[*prefetch_count_out].page = prefetch_page0;
+				prefetch_cache_out[*prefetch_count_out].itemid = itemid0;
+				(*prefetch_count_out)++;
+				__builtin_prefetch(itemid0, 0, 3);
+			}
+			if (found1)
+			{
+				prefetch_cache_out[*prefetch_count_out].page = prefetch_page1;
+				prefetch_cache_out[*prefetch_count_out].itemid = itemid1;
+				(*prefetch_count_out)++;
+				__builtin_prefetch(itemid1, 0, 3);
+			}
+			if (found2)
+			{
+				prefetch_cache_out[*prefetch_count_out].page = prefetch_page2;
+				prefetch_cache_out[*prefetch_count_out].itemid = itemid2;
+				(*prefetch_count_out)++;
+				__builtin_prefetch(itemid2, 0, 3);
+			}
+			if (found3)
+			{
+				prefetch_cache_out[*prefetch_count_out].page = prefetch_page3;
+				prefetch_cache_out[*prefetch_count_out].itemid = itemid3;
+				(*prefetch_count_out)++;
+				__builtin_prefetch(itemid3, 0, 3);
+			}
+		}
+		
+		/* Handle remaining items */
+		for (; j < *unvisitedLength; j++)
+		{
+			if (batch_found[j])
+			{
+				Page		prefetch_page;
+				OffsetNumber offno;
+				ItemId		itemid;
+				ItemPointer tid = &unvisited[j].indextid;
+				
+				/* Get the page and ItemId */
+				prefetch_page = BufferGetPage(batch_frameids[j] + 1);
+				offno = ItemPointerGetOffsetNumber(tid);
+				itemid = PageGetItemId(prefetch_page, offno);
+				
+				/* Cache page and ItemId for second-phase prefetch */
+				prefetch_cache_out[*prefetch_count_out].page = prefetch_page;
+				prefetch_cache_out[*prefetch_count_out].itemid = itemid;
+				(*prefetch_count_out)++;
+				
+				/* Prefetch ItemId */
+				__builtin_prefetch(itemid, 0, 3);
+			}
+		}
+	}
+	
+	/* Note: Second pass (vector data prefetch) is now done by caller (HnswSearchLayer) */
 }
 
 /*
@@ -825,6 +1144,17 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
+	uint32		cached_relation_id = 0;
+	bool		have_cached_relation_id = false;
+	HnswPrefetchCache prefetch_cache[HNSW_MAX_M];
+	int			prefetch_count = 0;
+
+	/* Cache relation ID once if supported by buffer manager */
+	if (!inMemory && ActiveBufMgr->GetRelationID != NULL)
+	{
+		SMgrRelation smgr = RelationGetSmgr(index);
+		have_cached_relation_id = ActiveBufMgr->GetRelationID(smgr, MAIN_FORKNUM, &cached_relation_id);
+	}
 
 	if (v == NULL)
 	{
@@ -888,7 +1218,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 		if (inMemory)
 			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
 		else
-			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc, prefetch_cache, &prefetch_count);
 
 		/* OK to count elements instead of tuples */
 		if (tuples != NULL)
@@ -900,6 +1230,13 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 			HnswSearchCandidate *e;
 			double		eDistance;
 			bool		alwaysAdd = wlen < ef;
+
+			/* Prefetch next element's vector data if available and not in memory */
+			if (!inMemory && prefetch_count > 0 && i + 1 < prefetch_count)
+			{
+				HnswElementTuple etup = (HnswElementTuple) PageGetItem(prefetch_cache[i + 1].page, prefetch_cache[i + 1].itemid);
+				__builtin_prefetch(&etup->data, 0, 3);
+			}
 
 			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
@@ -916,7 +1253,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement, cached_relation_id, have_cached_relation_id);
 
 				if (eElement == NULL)
 					continue;
