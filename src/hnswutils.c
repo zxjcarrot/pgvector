@@ -527,6 +527,156 @@ HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 }
 
+static float
+VectorL2SquaredDistance(int dim, float *ax, float *bx)
+{
+	float		distance = 0.0;
+
+	/* Auto-vectorized */
+	for (int i = 0; i < dim; i++)
+	{
+		float		diff = ax[i] - bx[i];
+
+		distance += diff * diff;
+	}
+
+	return distance;
+}
+
+/*
+ * Calculate L2 squared distance optimistically - assumes 'a' is stable but 'b' may be modified
+ * Directly computes distance without copying by validating varlena header first
+ */
+__attribute__((target_clones("default", "fma"))) static inline double
+HnswGetDistanceOptimistic(Datum a, Vector *b_ptr, Page page, HnswSupport * support)
+{
+	Size		varlena_len;
+	char	   *page_start;
+	char	   *page_end;
+	char	   *b_end;
+	int16		dim;
+	Vector	   *a_vec;
+	float		distance;
+	Vector      b_header = *b_ptr;
+	/* 
+	 * Read varlena header with memory barrier to ensure consistency
+	 * Note: b_ptr->vl_len_ could be corrupted by concurrent writers
+	 */
+	pg_read_barrier();
+	varlena_len = VARSIZE_ANY(&b_header);
+	
+	/* Calculate page bounds */
+	page_start = (char *) page;
+	page_end = page_start + BLCKSZ;
+	b_end = ((char *) b_ptr) + varlena_len;
+	
+	/* 
+	 * Validate varlena length is within page bounds
+	 * If corrupted, validation will fail - return dummy value
+	 */
+	if (varlena_len < VARHDRSZ || 
+	    varlena_len > BLCKSZ ||
+	    ((char *) b_ptr) < page_start ||
+	    ((char *) b_ptr) >= page_end ||
+	    b_end > page_end)
+	{
+		/* Invalid varlena header - validation will fail, return dummy value */
+		return 0.0;
+	}
+	
+	/* 
+	 * After varlena header validation passes, we can safely read the dimension field
+	 * The varlena header is valid, so reading dim is safe
+	 */
+	pg_read_barrier();
+	dim = b_header.dim;
+	// /* Get query vector */
+	// a_vec = DatumGetVector(a);
+	
+	// /* 
+	//  * Validate dimension matches query dimension
+	//  * If corrupted, validation will fail - return dummy value
+	//  */
+	// if (dim != a_vec->dim || dim <= 0 || dim > VECTOR_MAX_DIM)
+	// {
+	// 	/* Invalid dimension - validation will fail, return dummy value */
+	// 	return 0.0;
+	// }
+	
+	/* 
+	 * Now safe to directly compute L2 squared distance
+	 * Inline the computation to avoid function call overhead
+	 */
+	return VectorL2SquaredDistance(dim, ((Vector *) DatumGetPointer(a))->x, b_ptr->x);
+}
+
+/*
+ * Load element data optimistically from tuple
+ * This is like HnswLoadElementFromTuple but makes defensive copies for optimistic reads
+ */
+static inline void
+HnswLoadElementFromTupleOptimistic(HnswElement element, HnswElementTuple etup, 
+								   bool loadHeaptids, bool loadVec, Page page)
+{
+	/* Read basic fields - these are small and atomic on most architectures */
+	element->level = etup->level;
+	element->deleted = etup->deleted;
+	element->version = etup->version;
+	element->neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
+	element->neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
+	element->heaptidsLength = 0;
+	
+	if (loadHeaptids)
+	{
+		for (int i = 0; i < HNSW_HEAPTIDS; i++)
+		{
+			/* Can stop at first invalid */
+			if (!ItemPointerIsValid(&etup->heaptids[i]))
+				break;
+
+			HnswAddHeapTid(element, &etup->heaptids[i]);
+		}
+	}
+	
+	if (loadVec)
+	{
+		char	   *base = NULL;
+		Vector	   *vec_ptr = (Vector *) &etup->data;
+		Size		varlena_len;
+		Vector	   *vec_copy;
+		char	   *page_start;
+		char	   *page_end;
+		char	   *vec_end;
+		
+		/* Read varlena header with memory barrier */
+		pg_read_barrier();
+		varlena_len = VARSIZE_ANY(vec_ptr);
+		
+		/* Calculate page bounds */
+		page_start = (char *) page;
+		page_end = page_start + BLCKSZ;
+		vec_end = ((char *) vec_ptr) + varlena_len;
+		
+		/* Validate varlena length is within page bounds */
+		if (varlena_len < VARHDRSZ || 
+		    varlena_len > BLCKSZ ||
+		    ((char *) vec_ptr) < page_start ||
+		    ((char *) vec_ptr) >= page_end ||
+		    vec_end > page_end)
+		{
+			/* Invalid varlena header - will be caught by validation */
+			HnswPtrStore(base, element->value, (Pointer) NULL);
+			return;
+		}
+		
+		/* Make a proper copy of the entire varlena datum */
+		vec_copy = (Vector *) palloc(varlena_len);
+		memcpy(vec_copy, vec_ptr, varlena_len);
+		
+		HnswPtrStore(base, element->value, (Pointer) vec_copy);
+	}
+}
+
 /*
  * Load an element and optionally get its distance from q
  * cached_relation_id: Pre-computed relation ID (0 means compute it)
@@ -552,11 +702,13 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 	{
 		uint32 buf_id = 0;
 		void *entry_ptr = NULL;
-		
+		bool validation_passed = false;
+		bool was_element_null = (*element == NULL);
+		double old_distance = (distance != NULL) ? *distance : 0.0;
 		smgr = RelationGetSmgr(index);
 		
 		/* Use optimized path with cached relation_id if available */
-		if (have_cached_rid && CalicoLookupAndOptimisticPinWithRid != NULL)
+		if (CalicoLookupAndOptimisticPinWithRid != NULL)
 		{
 			/* Call Calico-specific function with cached relation_id to skip expensive lookup */
 			bufDesc = CalicoLookupAndOptimisticPinWithRid(
@@ -586,47 +738,111 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 		
 		if (found)
 		{
-			/* Got the buffer frame ID, access buffer pool directly to minimize cache misses */
-			//bufDesc = GetBufferDescriptor(frameId);
+			/* 
+			 * CRITICAL: All reads must happen BEFORE validation check.
+			 * After validation fails, the page may be evicted or modified.
+			 */
 			
 			/* Read shared_buffer page data optimistically */
 			page = BufferGetPage(buf_id + 1);
-			etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
-			
-			Assert(HnswIsElementTuple(etup));
-			
-			/* Calculate distance */
-			if (distance != NULL)
-			{
-				if (DatumGetPointer(q->value) == NULL)
-					*distance = 0;
-				else
-					*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
-			}
-			
-			/* Load element */
-			if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
-			{
-				if (*element == NULL)
-					*element = HnswInitElementFromBlock(blkno, offno);
+			//ItemIdData item_id_data = *PageGetItemId(page, offno);
+			bool should_load = false;
+			// validate item_id_data is wihtin bound of page
+			// if (ItemIdGetLength(&item_id_data) <= 0 ||
+			//     ItemIdGetOffset(&item_id_data) < SizeOfPageHeaderData ||
+			//     (ItemIdGetOffset(&item_id_data) + ItemIdGetLength(&item_id_data)) >= BLCKSZ)
+			// {
+			// 	/* Invalid item_id_data - will be caught by validation */
+			// 	validation_passed = false;
+			// } else {
+				/* Safe to read the tuple */
+				etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+				/* Calculate distance using safe optimistic method */
+				if (distance != NULL)
+				{
+					if (DatumGetPointer(q->value) == NULL)
+						*distance = 0;
+					else
+						/* Use specialized optimistic distance calculation with page bounds check */
+						*distance = HnswGetDistanceOptimistic(
+							q->value, 
+							(Vector *) &etup->data, 
+							page,
+							support
+						);
+						// *distance = HnswGetDistance(
+						// 	q->value, 
+						// 	PointerGetDatum(&etup->data), 
+						// 	support
+						// );
+				}
 				
-				HnswLoadElementFromTuple(*element, etup, true, loadVec);
-			}
+				/* Check if we should load element data */
+				should_load = (distance == NULL || maxDistance == NULL || 
+									*distance < *maxDistance);
+				
+				if (should_load)
+				{
+					// /* Allocate element if needed */
+					if (*element == NULL)
+						*element = HnswInitElementFromBlock(blkno, offno);
+					
+					// // /* Load element data using safe optimistic method with page bounds check */
+					// // HnswLoadElementFromTupleOptimistic(*element, etup, true, loadVec, page);
+					// // //HnswLoadElementFromTuple(*element, etup, true, loadVec);
+					if (loadVec) {
+						validation_passed = false; // Force validation failure
+					} else {
+						HnswLoadElementFromTuple(*element, etup, true, false);
+						validation_passed = ActiveBufMgr->LookupAndOptimisticValidate(entry_ptr, version);
+					}
+					
+				} else {
+					validation_passed = ActiveBufMgr->LookupAndOptimisticValidate(entry_ptr, version);
+				}
+			//}
+			/*
+			 * NOW validate the optimistic read.
+			 * This MUST be the last operation before returning.
+			 */
+			// if (validation_passed == false)
+			// 	validation_passed = ActiveBufMgr->LookupAndOptimisticValidate(entry_ptr, version);
 			
-			/* Validate the optimistic read using cached entry_ptr - fast path */
-			if (ActiveBufMgr->LookupAndOptimisticValidate(entry_ptr, version))
+			if (validation_passed)
 			{
-				/* Validation successful - data is consistent */
+				/* SUCCESS: All data read is consistent */
 				return;
 			}
 			
 			/*
-			 * Validation failed - fall through to locked path.
-			 * The page might have been evicted or modified.
+			 * VALIDATION FAILED
+			 * 
+			 * All data we read may be corrupted. We must:
+			 * 1. Free any allocated memory (element->value from loadVec)
+			 * 2. Reset element to pre-read state
+			 * 3. Fall through to locked path
 			 */
+			
+			if (should_load && *element != NULL)
+			{
+				// restore *element
+				// No need to free memory because memory context will clean up the allocated objects at once at the end
+				if (was_element_null)
+				{
+					*element = NULL;
+				}
+			}
+			if (distance != NULL)
+			{
+				/* Restore old distance value */
+				*distance = old_distance;
+			}
+			
+			/* Fall through to locked path */
 		}
 	}
 	
+locked_path:
 	/*
 	 * Traditional locked path:
 	 * Either optimistic read is disabled, not supported, or validation failed.
@@ -965,8 +1181,6 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 	bool		batch_found[HNSW_MAX_M];
 	int			batch_start = 0;  /* Track where current batch starts in unvisited array */
 
-#define BATCH_SIZE 6
-
 	*unvisitedLength = 0;
 	*prefetch_count_out = 0;
 
@@ -1009,6 +1223,8 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 	if (use_prefetch && *unvisitedLength > batch_start)
 	{
 		int batch_count = *unvisitedLength - batch_start;
+		BlockNumber missing_blocks[HNSW_MAX_M];
+		int			missing_count = 0;
 		
 		/* Final batch call for remaining items */
 		ActiveBufMgr->LookupAndOptimisticPinBatch(
@@ -1035,6 +1251,16 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 			found1 = batch_found[j + 1];
 			found2 = batch_found[j + 2];
 			found3 = batch_found[j + 3];
+			
+			/* Collect missing blocks for async I/O */
+			if (!found0)
+				missing_blocks[missing_count++] = batch_blocknums[j];
+			if (!found1)
+				missing_blocks[missing_count++] = batch_blocknums[j + 1];
+			if (!found2)
+				missing_blocks[missing_count++] = batch_blocknums[j + 2];
+			if (!found3)
+				missing_blocks[missing_count++] = batch_blocknums[j + 3];
 			
 			/* Get pages for all 4 items - these loads can happen in parallel */
 			if (found0)
@@ -1120,6 +1346,25 @@ HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *u
 				/* Prefetch ItemId */
 				__builtin_prefetch(itemid, 0, 3);
 			}
+			else
+			{
+				/* Collect missing block */
+				missing_blocks[missing_count++] = batch_blocknums[j];
+			}
+		}
+		
+		/*
+		 * Issue bulk async I/O for all missing blocks.
+		 * ReadBuffersAsync will group consecutive blocks and submit
+		 * all I/Os in one batch for maximum efficiency.
+		 */
+		if (missing_count > 0)
+		{
+			ReadBuffersAsync(smgr,
+							 index->rd_rel->relpersistence,
+							 MAIN_FORKNUM,
+							 missing_blocks,
+							 missing_count);
 		}
 	}
 	
