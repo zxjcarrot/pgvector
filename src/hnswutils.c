@@ -679,11 +679,9 @@ HnswLoadElementFromTupleOptimistic(HnswElement element, HnswElementTuple etup,
 
 /*
  * Load an element and optionally get its distance from q
- * cached_relation_id: Pre-computed relation ID (0 means compute it)
- * have_cached_rid: Whether cached_relation_id is valid
  */
 static void
-HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element, uint32 cached_relation_id, bool have_cached_rid)
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
 {
 	Buffer		buf;
 	Page		page;
@@ -707,34 +705,16 @@ HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, Hns
 		double old_distance = (distance != NULL) ? *distance : 0.0;
 		smgr = RelationGetSmgr(index);
 		
-		/* Use optimized path with cached relation_id if available */
-		if (CalicoLookupAndOptimisticPinWithRid != NULL)
-		{
-			/* Call Calico-specific function with cached relation_id to skip expensive lookup */
-			bufDesc = CalicoLookupAndOptimisticPinWithRid(
-				smgr,
-				MAIN_FORKNUM,
-				blkno,
-				&found,
-				&version,
-				&buf_id,
-				&entry_ptr,
-				cached_relation_id
-			);
-		}
-		else
-		{
-			/* Fall back to standard optimistic pin (computes relation_id internally) */
-			bufDesc = ActiveBufMgr->LookupAndOptimisticPin(
-				smgr,
-				MAIN_FORKNUM,
-				blkno,
-				&found,
-				&version,
-				&buf_id,
-				&entry_ptr
-			);
-		}
+		/* Use standard optimistic pin with TLS cache optimization */
+		bufDesc = ActiveBufMgr->LookupAndOptimisticPin(
+			smgr,
+			MAIN_FORKNUM,
+			blkno,
+			&found,
+			&version,
+			&buf_id,
+			&entry_ptr
+		);
 		
 		if (found)
 		{
@@ -884,7 +864,7 @@ void
 HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
 	/* No cached relation_id for this public wrapper */
-	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element, 0, false);
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
 }
 
 /*
@@ -1389,17 +1369,8 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
 	int			unvisitedLength;
 	bool		inMemory = index == NULL;
-	uint32		cached_relation_id = 0;
-	bool		have_cached_relation_id = false;
 	HnswPrefetchCache prefetch_cache[HNSW_MAX_M];
 	int			prefetch_count = 0;
-
-	/* Cache relation ID once if supported by buffer manager */
-	if (!inMemory && ActiveBufMgr->GetRelationID != NULL)
-	{
-		SMgrRelation smgr = RelationGetSmgr(index);
-		have_cached_relation_id = ActiveBufMgr->GetRelationID(smgr, MAIN_FORKNUM, &cached_relation_id);
-	}
 
 	if (v == NULL)
 	{
@@ -1498,7 +1469,7 @@ HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation in
 
 				/* Avoid any allocations if not adding */
 				eElement = NULL;
-				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement, cached_relation_id, have_cached_relation_id);
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
 
 				if (eElement == NULL)
 					continue;
