@@ -84,6 +84,7 @@
 extern int	ivfflat_probes;
 extern int	ivfflat_iterative_scan;
 extern int	ivfflat_max_probes;
+extern int	ivfflat_topk_prune_limit;
 
 typedef enum IvfflatIterativeScanMode
 {
@@ -276,6 +277,8 @@ typedef struct IvfflatScanOpaqueData
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
 	Datum		(*distfunc) (FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2);
+	bool		topKPruneActive;
+	int			topKPruneLimit;
 
 	/* Lists */
 	pairingheap *listQueue;

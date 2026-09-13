@@ -14,6 +14,144 @@
 
 #define GetScanList(ptr) pairingheap_container(IvfflatScanList, ph_node, ptr)
 #define GetScanListConst(ptr) pairingheap_const_container(IvfflatScanList, ph_node, ptr)
+#define IVFFLAT_TOPK_PRUNE_MAX_LIMIT 50
+
+/* from vector.c */
+extern Datum vector_l2_squared_distance(PG_FUNCTION_ARGS);
+
+typedef struct IvfflatTopKState
+{
+	int			limit;
+	int			count;
+	double		threshold;
+	pairingheap *heap;
+	struct IvfflatTopKNode
+	{
+		pairingheap_node ph_node;
+		double		distance;
+	}			nodes[IVFFLAT_TOPK_PRUNE_MAX_LIMIT];
+} IvfflatTopKState;
+
+/* Max-heap by distance (worst candidate at root) */
+static int
+CompareTopKNodes(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	const struct IvfflatTopKNode *na = pairingheap_const_container(struct IvfflatTopKNode, ph_node, a);
+	const struct IvfflatTopKNode *nb = pairingheap_const_container(struct IvfflatTopKNode, ph_node, b);
+
+	if (na->distance > nb->distance)
+		return 1;
+
+	if (na->distance < nb->distance)
+		return -1;
+
+	return 0;
+}
+
+static inline void
+IvfflatTopKInit(IvfflatTopKState *state, int limit)
+{
+	state->limit = limit;
+	state->count = 0;
+	state->threshold = DBL_MAX;
+	state->heap = pairingheap_allocate(CompareTopKNodes, NULL);
+}
+
+static inline void
+IvfflatTopKFree(IvfflatTopKState *state)
+{
+	pairingheap_free(state->heap);
+	state->heap = NULL;
+}
+
+static inline void
+IvfflatTopKConsider(IvfflatTopKState *state, double distance)
+{
+	struct IvfflatTopKNode *node;
+
+	if (state->count < state->limit)
+	{
+		node = &state->nodes[state->count++];
+		node->distance = distance;
+		pairingheap_add(state->heap, &node->ph_node);
+
+		if (state->count == state->limit)
+			state->threshold = pairingheap_container(struct IvfflatTopKNode, ph_node, pairingheap_first(state->heap))->distance;
+
+		return;
+	}
+
+	if (distance >= state->threshold)
+		return;
+
+	node = pairingheap_container(struct IvfflatTopKNode, ph_node, pairingheap_remove_first(state->heap));
+	node->distance = distance;
+	pairingheap_add(state->heap, &node->ph_node);
+	state->threshold = pairingheap_container(struct IvfflatTopKNode, ph_node, pairingheap_first(state->heap))->distance;
+}
+
+/*
+ * Compute L2 squared distance with chunked early-stop checks.
+ *
+ * Returns true if full distance is computed, false if computation is pruned
+ * because the partial distance exceeds threshold.
+ */
+static inline bool
+IvfflatL2SquaredDistancePruned(Vector *query, Vector *item, double threshold, double *distance)
+{
+	float		dist = 0.0f;
+	const float *qx = query->x;
+	const float *ix = item->x;
+	int			dim = query->dim;
+	int			i = 0;
+
+	Assert(item->dim == dim);
+
+	/*
+	 * Process in 64-dimension chunks and check threshold once per chunk to
+	 * reduce branch overhead in the hot loop.
+	 */
+	for (; i + 64 <= dim; i += 64)
+	{
+		float		blockDist = 0.0f;
+
+		for (int j = i; j < i + 64; j++)
+		{
+			float		diff = qx[j] - ix[j];
+
+			blockDist += diff * diff;
+		}
+
+		dist += blockDist;
+
+		if ((double) dist > threshold)
+		{
+			*distance = (double) dist;
+			return false;
+		}
+	}
+
+	/* Tail dimensions (at most 63) */
+	for (; i < dim; i++)
+	{
+		float		diff = qx[i] - ix[i];
+
+		dist += diff * diff;
+	}
+
+	*distance = (double) dist;
+	return true;
+}
+
+static inline Vector *
+IvfflatGetVectorForRead(Datum value, bool *needFree)
+{
+	Pointer		original = DatumGetPointer(value);
+	Vector	   *vec = DatumGetVector(value);
+
+	*needFree = PointerGetDatum(vec) != PointerGetDatum(original);
+	return vec;
+}
 
 /*
  * Compare list distances
@@ -115,9 +253,18 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	IvfflatScanOpaque so = (IvfflatScanOpaque) scan->opaque;
 	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
 	TupleTableSlot *slot = so->vslot;
+	IvfflatTopKState topk = {0};
+	bool		useTopKPrune = so->topKPruneActive && DatumGetPointer(value) != NULL;
+	bool		queryNeedsFree = false;
+	Vector	   *queryVec = NULL;
 	int			batchProbes = 0;
 
+	if (useTopKPrune)
+		queryVec = IvfflatGetVectorForRead(value, &queryNeedsFree);
+
 	tuplesort_reset(so->sortstate);
+	if (useTopKPrune)
+		IvfflatTopKInit(&topk, so->topKPruneLimit);
 
 	/* Search closest probes lists */
 	while (so->listIndex < so->maxProbes && (++batchProbes) <= so->probes)
@@ -136,28 +283,46 @@ GetScanItems(IndexScanDesc scan, Datum value)
 			page = BufferGetPage(buf);
 			maxoffno = PageGetMaxOffsetNumber(page);
 
-			for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
-			{
-				IndexTuple	itup;
-				Datum		datum;
-				bool		isnull;
-				ItemId		itemid = PageGetItemId(page, offno);
+				for (OffsetNumber offno = FirstOffsetNumber; offno <= maxoffno; offno = OffsetNumberNext(offno))
+				{
+					IndexTuple	itup;
+					Datum		datum;
+					double		distance;
+					bool		isnull;
+					ItemId		itemid = PageGetItemId(page, offno);
 
-				itup = (IndexTuple) PageGetItem(page, itemid);
-				datum = index_getattr(itup, 1, tupdesc, &isnull);
+					itup = (IndexTuple) PageGetItem(page, itemid);
+					datum = index_getattr(itup, 1, tupdesc, &isnull);
 
-				/*
-				 * Add virtual tuple
-				 *
-				 * Use procinfo from the index instead of scan key for
-				 * performance
-				 */
-				ExecClearTuple(slot);
-				slot->tts_values[0] = so->distfunc(so->procinfo, so->collation, datum, value);
-				slot->tts_isnull[0] = false;
-				slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
-				slot->tts_isnull[1] = false;
-				ExecStoreVirtualTuple(slot);
+					if (useTopKPrune)
+					{
+						bool		itemNeedsFree = false;
+						Vector	   *itemVec = IvfflatGetVectorForRead(datum, &itemNeedsFree);
+						bool		fullDistance = IvfflatL2SquaredDistancePruned(queryVec, itemVec, topk.threshold, &distance);
+
+						if (itemNeedsFree)
+							pfree(itemVec);
+
+						if (!fullDistance)
+							continue;
+
+						IvfflatTopKConsider(&topk, distance);
+					}
+					else
+						distance = DatumGetFloat8(so->distfunc(so->procinfo, so->collation, datum, value));
+
+					/*
+					 * Add virtual tuple
+					 *
+					 * Use procinfo from the index instead of scan key for
+					 * performance
+					 */
+					ExecClearTuple(slot);
+					slot->tts_values[0] = Float8GetDatum(distance);
+					slot->tts_isnull[0] = false;
+					slot->tts_values[1] = PointerGetDatum(&itup->t_tid);
+					slot->tts_isnull[1] = false;
+					ExecStoreVirtualTuple(slot);
 
 				tuplesort_puttupleslot(so->sortstate, slot);
 			}
@@ -167,6 +332,11 @@ GetScanItems(IndexScanDesc scan, Datum value)
 			UnlockReleaseBuffer(buf);
 		}
 	}
+
+	if (queryNeedsFree)
+		pfree(queryVec);
+	if (useTopKPrune)
+		IvfflatTopKFree(&topk);
 
 	tuplesort_performsort(so->sortstate);
 
@@ -276,6 +446,9 @@ ivfflatbeginscan(Relation index, int nkeys, int norderbys)
 	so->procinfo = index_getprocinfo(index, 1, IVFFLAT_DISTANCE_PROC);
 	so->normprocinfo = IvfflatOptionalProcInfo(index, IVFFLAT_NORM_PROC);
 	so->collation = index->rd_indcollation[0];
+	so->topKPruneLimit = ivfflat_topk_prune_limit;
+	so->topKPruneActive = ivfflat_topk_prune_limit > 0 && ivfflat_topk_prune_limit <= IVFFLAT_TOPK_PRUNE_MAX_LIMIT &&
+		so->procinfo->fn_addr == vector_l2_squared_distance;
 
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 									   "Ivfflat scan temporary context",

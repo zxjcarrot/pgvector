@@ -19,6 +19,7 @@
 int			ivfflat_probes;
 int			ivfflat_iterative_scan;
 int			ivfflat_max_probes;
+int			ivfflat_topk_prune_limit;
 static relopt_kind ivfflat_relopt_kind;
 
 static const struct config_enum_entry ivfflat_iterative_scan_options[] = {
@@ -47,8 +48,13 @@ IvfflatInit(void)
 
 	/* If this is less than probes, probes is used */
 	DefineCustomIntVariable("ivfflat.max_probes", "Sets the max number of probes for iterative scans",
-							NULL, &ivfflat_max_probes,
-							IVFFLAT_MAX_LISTS, IVFFLAT_MIN_LISTS, IVFFLAT_MAX_LISTS, PGC_USERSET, 0, NULL, NULL, NULL);
+								NULL, &ivfflat_max_probes,
+								IVFFLAT_MAX_LISTS, IVFFLAT_MIN_LISTS, IVFFLAT_MAX_LISTS, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("ivfflat.topk_prune_limit", "Enables L2 top-k distance pruning (0 disables)",
+							"Valid range is 0..50. Assumes query LIMIT <= this value for correctness.",
+							&ivfflat_topk_prune_limit,
+							0, 0, 50, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("ivfflat");
 }
